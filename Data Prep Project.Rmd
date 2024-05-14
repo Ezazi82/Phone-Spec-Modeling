@@ -1,0 +1,610 @@
+---
+title: "Data Prep Project"
+author: "Cameron Ezazi"
+date: "2024-03-05"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+
+Calling Necessary Libraries
+```{r}
+library(GGally)
+library(ggplot2)
+library(reshape2)
+library(ggpubr)
+library(dplyr)
+library(caret)
+library(pROC)
+library(yardstick)
+library(fastDummies)
+library(gains)
+```
+
+Preliminary Data Exploration
+```{r}
+#dataset: https://www.kaggle.com/datasets/iabhishekofficial/mobile-price-classification/data?select=train.csv
+
+#Basic data importing and exploration
+mobile_train <- read.csv('train.csv')
+head(mobile_train)
+dim(mobile_train)
+colnames(mobile_train)
+str(mobile_train)
+summary(mobile_train)
+sum(is.na(mobile_train))
+#No missing values
+```
+
+
+Basic variable manipulation
+```{r}
+#Binning response variable for simplicity and making Categorical Variables
+mobile_train$price_range <- ifelse(mobile_train$price_range == c(0, 1), 0, 1)
+
+#Due to the nature of the problem, we are looking to classify 1's better
+#I am attempting to predict not only important factors to a phone's price
+#But also to be able to use the models to attempt to see if a phone may be overpriced
+
+
+mobile_train$n_cores <- as.factor(cut(as.numeric(mobile_train$n_cores), breaks =
+                                        c(0, 2, 4, 6, 8), labels = c('1_2cores',
+                                          '3_4cores', '5_6cores', '7_8cores')))
+
+mobile_train <- dummy_cols(mobile_train, select_columns = 'n_cores', 
+                           remove_first_dummy = TRUE)
+
+cat.names <- c('blue', 'dual_sim', 'wifi', 'touch_screen', 'four_g', 'three_g',
+               'n_cores', 'price_range', 'n_cores_3_4cores', 'n_cores_5_6cores',
+               'n_cores_7_8cores')
+
+mobile_train[, cat.names] <- lapply(mobile_train[, cat.names], as.factor)
+mobile.train.nums <- mobile_train[, -which(names(mobile_train) %in% cat.names)]
+
+#Some feature engineering
+#Both of these new variables are acceptable, and represent values for resolution and screen area
+mobile_train$px_area <- mobile_train$px_height * mobile_train$px_width
+mobile_train$sc_area <- mobile_train$sc_h * mobile_train$sc_w
+```
+
+
+Plotting
+```{r}
+cor_matrix <- round(cor(mobile.train.nums), 2)
+melted.cor_mat <- melt(cor_matrix)
+ggplot(melted.cor_mat, aes(x = Var1, y = Var2, fill = value)) + 
+  geom_tile() +
+  xlab("") +
+  ylab("") +
+  scale_fill_distiller(palette = "RdBu", limits = c(-1, 1)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+#This is a good correlation matrix
+#We can see that 2 of our biggest predictor correlates are pc/fc and pixel height/width
+#All fairly obvious things to be correlated with one another
+
+#As such, we will remove 3G as a variable, as almost no phones now are sold with 3G and not 4G
+#We will also remove fc, and create a new variable out of length and width that is a ratio
+par(mfrow = c(1, 2))
+plot(mobile_train$px_height ~ mobile_train$px_width, xlab = 'Pixel Width',
+     ylab = 'Pixel Height', main = 'Pixel Height vs Width')
+plot(mobile_train$sc_h ~ mobile_train$sc_w, xlab = 'Screen Width',
+     ylab = 'Screen Height', main = 'Screen Height vs Width')
+#Yes, we see that they have a linear interaction
+
+
+#Creating boxplots for a couple of variables
+
+box.Cores.RAM <- ggplot(mobile_train) + geom_boxplot(aes(x = as.factor(n_cores), y = ram), 
+                            fill = c("#0099f8", "#e74c3c", "#2ecc71", '#FFC300')) +
+                      xlab('Number of Cores') + ylab('RAM') + theme_classic()
+box.price.RAM <- ggplot(mobile_train) + geom_boxplot(aes(x = as.factor(price_range), y = ram),
+                                                     fill = c("#0099f8", "#e74c3c")) +
+                      xlab('Price Range') + ylab('RAM') + theme_classic()
+box.price.battery <- ggplot(mobile_train) + geom_boxplot(aes(x = as.factor(price_range), y = 
+                      battery_power), fill = c("#2ecc71", '#FFC300')) +
+                      xlab('Price Range') + ylab('Battery Power') + theme_classic()
+
+ggarrange(box.Cores.RAM, box.price.battery, box.price.RAM, nrow = 3, ncol = 1)
+
+ggplot(mobile_train) + geom_histogram(aes (x = price_range), stat = 'count', bins = 10,
+                                  color = '#000000', fill = '#0099F8') + theme_test()
+
+#There appears to be more 'expensive' phones, or 1's, than 0's
+#We will remedy this by oversampling
+
+#pairs(mobile.train.nums)
+#No higher-order terms needed
+```
+
+
+#More data steps (no longer needed after graphing)
+```{r}
+drop.cols <- c('px_height', 'px_width', 'three_g', 'fc', 'sc_h', 'sc_w', 'n_cores')
+mobile_train <- mobile_train[, -which(names(mobile_train) %in% drop.cols)]
+```
+
+
+Oversampling the data
+```{r}
+jittr <- function(data){  #a function that adds a small amount of random noise to data
+  avg <- mean(data)
+  for (i in 1:length(data)){
+    data[i] <- data[i] + (rnorm(1, mean = 0, sd = .01) * median(data))
+  }
+  return(data)
+}
+
+ovr.size = table(mobile_train$price_range)[2] - table(mobile_train$price_range)[1]
+#So we need to oversample by 926 data points on the minority class, '0'
+#It makes sense that there are less 'cheap' phones on the market
+
+x <- mobile_train[sample(which(mobile_train$price_range == 0),
+                         size = ovr.size, replace = TRUE), ]
+
+xcat <- x[, which(names(x) %in% cat.names)]
+xnum <- as.data.frame(apply(x[, -which(names(x) %in% cat.names)],
+                         2, FUN = jittr))
+xnum
+
+x <- cbind(xcat, xnum)
+
+mobile_train_new <- rbind(mobile_train, x)
+
+
+mobile_train_new[, -which(names(mobile_train_new) %in% cat.names)]
+
+
+#install.packages('performanceEstimation')
+#library(performanceEstimation)
+#mobile_train_new <- smote(price_range~ ., data = mobile_train, perc.over = 2.724395,
+#                          k = 5, perc.under = 1)
+#table(mobile_train$price_range)
+#table(mobile_train_new$price_range)
+#1463/537
+#mobile_train_new <- mobile_train
+```
+
+
+```{r}
+ggplot(mobile_train_new) + geom_histogram(aes (x = price_range), stat = 'count', bins = 10,
+                                  color = '#000000', fill = '#0099F8') + theme_test()
+```
+
+
+
+Working with Test Data
+```{r}
+#Modifying test data
+mobile_test <- read.csv('test.csv')
+
+cat.names.test <- c('blue', 'dual_sim', 'wifi', 'touch_screen', 'four_g', 'three_g',
+               'n_cores')
+
+mobile_test[, cat.names.test] <- lapply(mobile_test[, cat.names.test], as.factor)
+
+mobile_test$px_area <- mobile_test$px_height * mobile_test$px_width
+mobile_test$sc_area <- mobile_test$sc_h * mobile_test$sc_w
+
+
+drop.cols <- c('px_height', 'px_width', 'three_g', 'fc', 'sc_h', 'sc_w')
+mobile_test <- mobile_test[, -which(names(mobile_test) %in% drop.cols)]
+```
+
+
+
+Performing PCA and Checking for Categorical Interaction
+```{r}
+#Lets run a PCA on our numeric variables
+pca.mobile <- prcomp(mobile.train.nums, scale. = TRUE)
+summary(pca.mobile)
+pca.mobile$rot
+#Each PC contributes almost 10% of the variation to our data, thus we have no need
+#to use the PC's
+mobile.train.cat <- mobile_train[, which(names(mobile_train) %in% cat.names)]
+
+chi.selection.blue <- lapply(mobile.train.cat[, -1], 
+                        function(x) chisq.test(mobile.train.cat[, 1], x))
+chi.selection.dual <- lapply(mobile.train.cat[, -2], 
+                        function(x) chisq.test(mobile.train.cat[, 2], x))
+chi.selection.four <- lapply(mobile.train.cat[, -3], 
+                        function(x) chisq.test(mobile.train.cat[, 3], x))
+chi.selection.touch <- lapply(mobile.train.cat[, -4], 
+                        function(x) chisq.test(mobile.train.cat[, 4], x))
+chi.selection.wifi <- lapply(mobile.train.cat[, -5], 
+                        function(x) chisq.test(mobile.train.cat[, 5], x))
+chi.selection.price <- lapply(mobile.train.cat[, -6], 
+                        function(x) chisq.test(mobile.train.cat[, 6], x))
+
+do.call(rbind, c(chi.selection.blue, ' ', chi.selection.dual, ' ', chi.selection.four,
+                 ' ', chi.selection.price, ' ', chi.selection.touch, ' ', chi.selection.wifi))
+#As we can see, no p-values below .05 for Chi-Square test of Independence
+#We reject no null hypotheses that any 2 variables are independent here
+```
+
+
+#Creating Training and Holdout Partitions
+```{r}
+mobile_train_idx <- sample(nrow(mobile_train_new), size =(.7 * nrow(mobile_train_new)), 
+                           replace = FALSE)
+mobile_train_new1 <- mobile_train_new[mobile_train_idx, ]
+mobile_holdout <- mobile_train_new[-mobile_train_idx, ]
+```
+
+
+
+#Modeling
+```{r}
+#We will be performing a logistic regression, so we will convert our response
+#back to numeric
+
+mobile.train.full <- glm(price_range ~ ., family = binomial, data = mobile_train_new1)
+mobile.train.1 <- glm(price_range ~ 1, family = binomial, data = mobile_train_new1)
+
+summary(mobile.train.full)
+
+mobile.train.back <- step(mobile.train.full, trace = 0)
+mobile.train.fwd <- step(mobile.train.1, scope = price_range ~ battery_power +
+                          blue + clock_speed + dual_sim + four_g + 
+                           int_memory + m_dep + mobile_wt + n_cores_3_4cores + 
+                           n_cores_5_6cores + n_cores_7_8cores +
+                           pc + ram + talk_time + touch_screen + wifi + px_area +
+                           sc_area, direction = 'forward', trace = 0)
+mobile.train.both <- step(mobile.train.1, scope = price_range ~ battery_power +
+                          blue + clock_speed + dual_sim + four_g + 
+                           int_memory + m_dep + mobile_wt + n_cores_3_4cores + 
+                           n_cores_5_6cores + n_cores_7_8cores + 
+                           pc + ram + talk_time + touch_screen + wifi + px_area +
+                            sc_area, direction = 'both', trace = 0)
+
+#As our output shows, all 3 models are identical, and achieve almost exactly
+#equal AIC values
+
+#With our model already somewhat small, we will refrain from making an even
+#smaller one using BIC
+
+
+#Using cross-validation to check our models
+trControl = caret::trainControl(method = 'cv', number = 5, verboseIter = TRUE, 
+                                allowParallel = TRUE)
+mobile.train.back.cv <- caret::train(price_range ~ ., data = mobile_train_new1,
+                                     trControl = trControl, method = 'glmStepAIC',
+                                     direction = 'backward', trace = 0)
+mobile.train.back.cv$finalModel
+
+mobile.train.fwd.cv <- caret::train(price_range ~ ., data = mobile_train_new1,
+                                     trControl = trControl, method = 'glmStepAIC',
+                                     direction = 'forward', trace = 0)
+mobile.train.fwd.cv$finalModel
+
+mobile.train.both.cv <- caret::train(price_range ~ ., data = mobile_train_new1,
+                                     trControl = trControl, method = 'glmStepAIC',
+                                     direction = 'both', trace = 0)
+mobile.train.both.cv$finalModel
+
+#Cross-validated models show nearly identical AIC, but slightly different models
+
+mobile.train.best1 <- glm(price_range ~ battery_power + blue + ram + px_area +
+                            mobile_wt + touch_screen + n_cores_3_4cores + m_dep, 
+                          data = mobile_train_new1, family = binomial)
+
+summary(mobile.train.best1)
+```
+
+
+Prediction
+```{r}
+
+mobile.best.pred <- predict(mobile.train.best1, newdata = mobile_holdout, type = 'response')
+mobile.full.pred <- predict(mobile.train.full, newdata = mobile_holdout, type = 'response')
+
+cnf.full.train <- confusionMatrix(as.factor(ifelse(mobile.full.pred > .5, 1, 0)),
+                (mobile_holdout$price_range))
+cnf.half.pred <- confusionMatrix(as.factor(ifelse(mobile.best.pred > .5, 1, 0)), 
+                (mobile_holdout$price_range))
+cfn.qtr.pred <- confusionMatrix(as.factor(ifelse(mobile.best.pred > .25, 1, 0)),
+                (mobile_holdout$price_range))
+cfn.thrd.pred <- confusionMatrix(as.factor(ifelse(mobile.best.pred > .75, 1, 0)),
+                (mobile_holdout$price_range))
+
+```
+
+
+#Tree Modeling
+```{r}
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+
+mobile_tree <- rpart(price_range ~ ., data = mobile_train_new1, method = 'class',
+                     control = rpart.control(maxdepth = 8), cp = 0)
+printcp(mobile_tree)
+prp(mobile_tree, type = 1, extra = 1)
+#We have grown as full of a tree as possible, w/ the complexity parameter at 0
+plotcp(mobile_tree)
+
+mobile_tree_prune <- prune(mobile_tree, cp = mobile_tree$cptable[which.min
+                                        (mobile_tree$cptable[, 'xerror']), 'CP'])
+prp(mobile_tree_prune, type = 1, extra = 1)
+#So we see that the pruned tree is the same, so we have found the minimum error
+#tree that best sorts the data (based on our training set)
+
+
+
+mobile_tree_pred <- predict(mobile_tree_prune, mobile_train_new1, type = 'class')
+confusionMatrix(as.factor(mobile_tree_pred), as.factor(mobile_train_new1$price_range))
+
+mobile_tree_pred_hold <- predict(mobile_tree_prune, mobile_holdout, type = 'class')
+confusionMatrix(as.factor(mobile_tree_pred_hold), as.factor(mobile_holdout$price_range))
+cnf.half.pred #This is the confusion matrix for the previous best model
+#Clearly, the decision tree already has a better accuracy
+
+
+#Now lets do a random forest and see if we get much better
+mobile_forest <- randomForest(price_range ~ ., data = mobile_train_new1, ntree = 500,
+                              mtry = 4, nodesize = 1, importance = TRUE)
+varImpPlot(mobile_forest, type = 1)
+#As we have previously seen, RAM is by and away the most important predictor
+#We trust this more as it is the collation of multiple (500) tree models
+
+forest_pred <- predict(mobile_forest, newdata = mobile_holdout)
+confusionMatrix(as.factor(forest_pred), as.factor(mobile_holdout$price_range))
+#An even higher, and rather impressive, accuracy has been achieved
+
+round(importance(mobile_forest), 2)
+
+
+mobile_forest2 <- randomForest(price_range ~ ram + px_area + battery_power + sc_area +
+                                 clock_speed + talk_time + m_dep + int_memory + 
+                                 mobile_wt + pc, data = mobile_train_new1, ntree = 500,
+                              mtry = 4, nodesize = 1, importance = TRUE)
+varImpPlot(mobile_forest2, type = 1)
+forest_pred2 <- predict(mobile_forest2, newdata = mobile_holdout)
+confusionMatrix(as.factor(forest_pred2), as.factor(mobile_holdout$price_range))
+
+#As we can see, the reduced model performs slightly worse, but is lower dimension
+
+#Now lets try with variables from step-wise variables selection
+mobile_forest3 <- randomForest(price_range ~ ram + px_area + battery_power + blue +
+                                 four_g + talk_time + n_cores_3_4cores + 
+                                 mobile_wt, data = mobile_train_new1, ntree = 500,
+                              mtry = 4, nodesize = 1, importance = TRUE)
+varImpPlot(mobile_forest3, type = 1)
+forest_pred3 <- predict(mobile_forest3, newdata = mobile_holdout)
+confusionMatrix(as.factor(forest_pred3), as.factor(mobile_holdout$price_range))
+#Very slightly worse than the full model, but better than reduced model from importance
+```
+
+
+#Naive Bayes
+```{r}
+library(e1071)
+str(mobile_train_new)
+mobile.num.names <- c('battery_power', 'clock_speed', 'int_memory', 'm_dep',
+                      'mobile_wt', 'pc', 'ram', 'talk_time', 'px_area', 'sc_area')
+
+
+#We could transform the slightly weird distribution of ram using log, which makes
+#a poisson dist., however it does not help accuracy much, so we keep for interpretability
+
+
+mobile.train.nums <- mobile_train_new[, which(names(mobile_train_new) %in% 
+                                                 mobile.num.names)]
+mobile.bayes.cat <- mobile_train_new[, -which(names(mobile_train_new) %in% 
+                                                 mobile.num.names)]
+
+mobile.bayes.num <- as.data.frame(lapply(mobile_train_new[, which(names
+                                        (mobile_train_new) %in% mobile.num.names)],
+                                           function(x) cut(x, breaks = 8)))
+
+mobile.bayes <- cbind(mobile.bayes.cat, mobile.bayes.num)
+
+
+#We must resample after transformations needed for Bayes
+
+mobile.train.nb <- mobile.bayes[mobile_train_idx, ]
+mobile.hold.nb <- mobile.bayes[-mobile_train_idx, ]
+
+prop.table(table(mobile.train.nb$price_range, mobile.train.nb$ram), margin = 1)
+#We see that higher groupings of RAM have no observations for 'cheap' phones
+
+#Most variables look pretty well distributed
+barchart(mobile.train.nb$clock_speed)
+barchart(mobile.train.nb$ram)
+barchart(mobile.train.nb$m_dep)
+barchart(mobile.train.nb$mobile_wt)
+barchart(mobile.train.nb$pc)
+barchart(mobile.train.nb$talk_time)
+barchart(mobile.train.nb$px_area)
+barchart(mobile.train.nb$sc_area)
+barchart(mobile.train.nb$battery_power)
+barchart(mobile.train.nb$int_memory)
+
+
+#Modeling
+nb.model <- naiveBayes(price_range ~ ., data = mobile.train.nb)
+
+
+nb.train.pred <- predict(nb.model, newdata = mobile.train.nb)
+confusionMatrix(as.factor(nb.train.pred), as.factor(mobile.train.nb$price_range))
+
+
+nb.hold.pred <- predict(nb.model, newdata = mobile.hold.nb)
+confusionMatrix(as.factor(nb.hold.pred), as.factor(mobile.hold.nb$price_range))
+```
+
+
+#ADABoost
+```{r}
+#install.packages('JOUSBoost')
+library(JOUSBoost)
+
+mobile_train_boost <- mobile.train.nb
+mobile_train_boost$price_range <- ifelse(mobile_train_boost$price_range == 0,-1, 1)
+
+mobile_hold_boost <- mobile.hold.nb
+mobile_hold_boost$price_range <- ifelse(mobile_hold_boost$price_range == 0, -1, 1)
+
+
+mobile_boost_mod1 <- adaboost(as.matrix(mobile_train_boost[, -6]),
+                                mobile_train_boost$price_range, tree_depth = 2,
+                                n_rounds = 200)
+
+ada.pred.train1 <- predict(mobile_boost_mod1, as.matrix(mobile_train_boost[, -6]),
+                                   type = 'response')
+confusionMatrix(as.factor(ada.pred.train1), as.factor(mobile_train_boost$price_range))
+
+
+ada.pred.hold1 <- predict.adaboost(mobile_boost_mod1, as.matrix(mobile_hold_boost[, -6]),
+                                    type = 'response')
+confusionMatrix(as.factor(ada.pred.hold1), as.factor(mobile_hold_boost$price_range))
+
+
+#ADABoost w/ greater depth
+mobile_boost_mod2 <- adaboost(as.matrix(mobile_train_boost[, -6]),
+                                mobile_train_boost$price_range, tree_depth = 4,
+                                n_rounds = 100)
+
+ada.pred.train2 <- predict(mobile_boost_mod2, as.matrix(mobile_train_boost[, -6]),
+                                   type = 'response')
+confusionMatrix(as.factor(ada.pred.train2), as.factor(mobile_train_boost$price_range))
+
+
+ada.pred.hold2 <- predict.adaboost(mobile_boost_mod2, as.matrix(mobile_hold_boost[, -6]),
+                                    type = 'response')
+confusionMatrix(as.factor(ada.pred.hold2), as.factor(mobile_hold_boost$price_range))
+
+```
+
+
+#XGBoost
+```{r}
+#install.packages('xgboost')
+library(xgboost)
+
+str(mobile_train_new)
+dim(mobile_train_new)
+
+mobile.xg <- mobile_train_new
+
+for (i in 1:19){
+  if (!(names(mobile.xg[i]) %in% mobile.num.names)){
+    mobile.xg[, i] <- as.numeric(mobile.xg[, i])
+  }
+}
+str(mobile.xg)
+mobile.xg[, 'price_range'] <- as.factor(mobile.xg[, 'price_range'])
+mobile.xg[, 'price_range'] <- ifelse(mobile.xg[, 'price_range'] == 1, 0, 1)
+
+mobile.xg.train <- mobile.xg[mobile_train_idx, ]
+mobile.xg.hold <- mobile.xg[-mobile_train_idx, ]
+
+
+
+xg.model.train <- xgboost(data = as.matrix(mobile.xg.train[, -14]), label =
+                            as.matrix(mobile.xg.train[, 14]), max.depth = 4,
+                          nrounds = 100, objective = 'binary:logistic')
+#Slightly marginal improvement from depth 5, so we keep for time's sake
+
+xg.train.pred <- predict(xg.model.train, as.matrix(mobile.xg.train[, -14]))
+xg.train.pred <- ifelse(xg.train.pred > .5, 1, 0)
+confusionMatrix(as.factor(xg.train.pred), as.factor(mobile.xg.train$price_range))
+
+xg.hold.pred <- predict(xg.model.train, as.matrix(mobile.xg.hold[, -14]))
+xg.hold.pred1 <- ifelse(xg.hold.pred > .5, 1, 0)
+confusionMatrix(as.factor(xg.hold.pred1), as.factor(mobile.xg.hold$price_range))
+```
+
+
+#ROC Curves
+```{r}
+roc(mobile_holdout$price_range ~ mobile.best.pred, plot = TRUE,
+    print.auc = TRUE, col = 'yellow')
+roc(mobile_holdout$price_range ~ mobile.full.pred, plot = TRUE,
+    print.auc = TRUE, col = 'blue', add = TRUE, print.auc.y = .3)
+roc(as.numeric(mobile.hold.nb$price_range) ~ as.numeric(nb.hold.pred), 
+    plot = TRUE, print.auc = TRUE, col = 'red', add = TRUE, print.auc.y = .4)
+roc(as.numeric(mobile_holdout$price_range) ~ as.numeric(forest_pred),
+    plot = TRUE, print.auc = TRUE, col = 'green', add = TRUE, print.auc.y = .2)
+roc(as.numeric(mobile_hold_boost$price_range) ~ as.numeric(ada.pred.hold2),
+    plot = TRUE, print.auc = TRUE, col = 'black', add = TRUE, print.auc.y = .1)
+#roc(as.numeric(mobile_holdout$price_range) ~ as.numeric(mobile.pred.ram),
+#    plot = TRUE, print.auc = TRUE, col = 'purple', add = TRUE, print.auc.y = 0)
+roc(mobile.xg.hold$price_range ~ xg.hold.pred, plot = TRUE, print.auc = TRUE,
+    col = 'orange', add = TRUE, print.auc.y = .03)
+legend('topleft', legend = c('Best Stepwise Model', 'Full Model',
+          'Naive Bayes Model', 'Random Forest Model', 'ADABoost (Depth 3)', 'XGBoost'),
+       col = c('yellow', 'blue', 'red', 'green', 'black', 'orange'), lwd = 1, cex = .7)
+```
+
+#Confusion Matrices
+```{r}
+#Full Model
+full.cf <- confusionMatrix(as.factor(ifelse(mobile.full.pred > .5, 1, 0)),
+                (mobile_holdout$price_range))
+
+#Best Model
+best.cf <- confusionMatrix(as.factor(ifelse(mobile.best.pred > .5, 1, 0)), 
+                (mobile_holdout$price_range))
+
+#Decision Tree
+tree.cf <- confusionMatrix(as.factor(mobile_tree_pred_hold), as.factor(mobile_holdout$price_range))
+
+#Random Forest
+forest.cf <- confusionMatrix(as.factor(forest_pred), as.factor(mobile_holdout$price_range))
+
+#Naive Bayes
+nb.cf <- confusionMatrix(as.factor(nb.hold.pred), as.factor(mobile.hold.nb$price_range))
+
+#ADABoost
+ada.cf <- confusionMatrix(as.factor(ada.pred.hold2), as.factor(mobile_hold_boost$price_range))
+
+#XGBoost
+xg.cf <- confusionMatrix(as.factor(xg.hold.pred1), as.factor(mobile.xg.hold$price_range))
+
+
+model.metrics <- data.frame(Method = c('Full Model', 'Best Model', 'Decision Tree',
+                                       'Random Forest', 'Naive Bayes', 'ADABoost', 'XGBoost'),
+                            Accuracy = c(full.cf$overall[[1]], best.cf$overall[[1]],
+                                         tree.cf$overall[[1]], forest.cf$overall[[1]],
+                                         nb.cf$overall[[1]], ada.cf$overall[[1]],
+                                         xg.cf$overall[[1]]),
+                            Sensitivity = c(full.cf$byClass[[1]], best.cf$byClass[[1]],
+                                            tree.cf$byClass[[1]], forest.cf$byClass[[1]],
+                                            nb.cf$byClass[[1]], ada.cf$byClass[[1]],
+                                            xg.cf$byClass[[1]]),
+                            Specificity = c(full.cf$byClass[[2]], best.cf$byClass[[2]],
+                                            tree.cf$byClass[[2]], forest.cf$byClass[[2]],
+                                            nb.cf$byClass[[2]], ada.cf$byClass[[2]],
+                                            xg.cf$byClass[[2]]))
+model.metrics
+```
+
+
+
+
+#Gains Chart (for XGBoost)
+```{r}
+library(gains)
+
+xg.gains <- gains(as.numeric(mobile_holdout$price_range), as.numeric(xg.hold.pred))
+
+plot(c(0, xg.gains$cume.pct.of.total * sum(as.numeric(mobile_holdout$price_range == 0))) ~
+       c(0, xg.gains$cume.obs), xlab = 'Number of Cases', ylab = 'Cumulative',
+     main = 'Gains Chart', type = 'l')
+lines(c(0,sum(as.numeric(mobile_holdout$price_range == 0)))~c(0,dim(mobile_holdout)[1]),
+      col="gray", lty=2)
+
+barplot(xg.gains$mean.resp/.5, names.arg = xg.gains$depth,
+        xlab = "Percentile", ylab = "Mean Response (Lift)", main = "Decile-Wise Lift Chart")
+
+```
+
